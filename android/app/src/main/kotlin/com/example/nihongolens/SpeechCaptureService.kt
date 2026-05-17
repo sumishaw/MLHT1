@@ -18,21 +18,49 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * SpeechCaptureService  —  Word-streaming real-time build
+ * SpeechCaptureService  —  Fixed / resilient build
  *
- * Audio pipeline:
+ * KEY FIXES vs original:
+ *
+ *  1. CAPTURE NEVER STOPS ON WHISPER FAILURE.
+ *     sendToWhisper() catches all exceptions and logs them — the capture
+ *     loop continues producing the next 1-second chunk regardless.
+ *
+ *  2. EXPONENTIAL BACK-OFF ON CONSECUTIVE FAILURES.
+ *     After 3 consecutive Whisper failures, the service waits up to 5 s
+ *     before submitting the next chunk, so it doesn't spam the log with
+ *     "connection refused" lines every second while whisper restarts.
+ *     As soon as one chunk succeeds, the back-off resets to zero.
+ *
+ *  3. FULLY OFFLINE.
+ *     All network calls target 127.0.0.1 only (Whisper on :8765,
+ *     LibreTranslate on :5000). No external internet access is required.
+ *     The service works the moment both servers are running locally,
+ *     whether or not the device has an internet connection.
+ *
+ *  4. LIBRETRANSLATE FALLBACK.
+ *     If the Whisper server returns a Hindi string directly (server-side
+ *     translation), it is used as-is. If the server only returns the
+ *     source-language transcript, SpeechCaptureService translates it
+ *     locally via LibreTranslate on 127.0.0.1:5000 — also offline.
+ *
+ *  5. NO HEALTH-CHECK DEPENDENCY.
+ *     The service never calls isModelReady / the health endpoint before
+ *     sending a chunk. It simply tries to send and handles failure
+ *     gracefully.
+ *
+ * Audio pipeline (unchanged):
  *   1. Capture 1 s of internal device audio (no microphone) via
  *      AudioPlaybackCaptureConfiguration + MediaProjection
  *   2. Wrap PCM in a WAV header
- *   3. POST to whisper_server.py → receive full Hindi sentence JSON
- *   4. Split sentence into individual words
- *   5. Post each word to OverlayService at WORD_INTERVAL_MS intervals
- *      so the subtitle types out word-by-word in real time
- *
- * OverlayService owns all line/wrap/read-pause logic.
- * This service only feeds it one word at a time.
+ *   3. POST to whisper_server.py → receive JSON
+ *   4. If JSON contains "text" (Hindi), display directly.
+ *      If JSON only has "source_text" (original lang), translate via
+ *      LibreTranslate at 127.0.0.1:5000.
+ *   5. Stream words one-by-one to OverlayService.
  */
 class SpeechCaptureService : Service() {
 
@@ -52,19 +80,26 @@ class SpeechCaptureService : Service() {
         private const val SAMPLE_RATE = 16_000
         private const val WHISPER_URL = "http://127.0.0.1:8765/transcribe"
 
-        // 1-second audio chunks → first subtitle within ~1-2 s of speech
+        // LibreTranslate running locally (started with --load-only en,hi,...)
+        private const val LIBRE_URL   = "http://127.0.0.1:5000/translate"
+
+        // 1-second audio chunks
         private const val CHUNK_SAMPLES = SAMPLE_RATE * 1       // 16 000 samples
         private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2     // 32 000 bytes
 
-        // 0.5 s carried into next chunk for sentence-boundary context
+        // 0.5 s overlap for sentence-boundary context
         private const val OVERLAP_BYTES = SAMPLE_RATE / 2 * 2  // 16 000 bytes
 
-        // Delay between successive words posted to the overlay.
-        // 180 ms ≈ natural spoken cadence (~330 wpm).
+        // Delay between successive words posted to the overlay (~330 wpm)
         private const val WORD_INTERVAL_MS = 180L
 
         // Suppress identical consecutive results within this window
         private const val DEDUP_WINDOW_MS = 1_200L
+
+        // Back-off: wait up to this many ms between chunks after failures
+        private const val MAX_BACKOFF_MS  = 5_000L
+        private const val BACKOFF_STEP_MS = 1_000L
+        private const val FAILURE_THRESHOLD = 3   // failures before back-off kicks in
     }
 
     private val mainHandler    = Handler(Looper.getMainLooper())
@@ -83,6 +118,9 @@ class SpeechCaptureService : Service() {
     // Pending word-stream runnables — cancelled when a newer result arrives
     private val pendingWordRunnables = mutableListOf<Runnable>()
 
+    // Consecutive failure counter for back-off
+    private val consecutiveFailures = AtomicInteger(0)
+
     // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     override fun onCreate() {
@@ -100,8 +138,9 @@ class SpeechCaptureService : Service() {
         }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         @Suppress("WakelockTimeout")
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CaptionLens::SpeechCapture")
-            .also { it.acquire(60 * 60 * 1000L) }
+        wakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK, "CaptionLens::SpeechCapture"
+        ).also { it.acquire(60 * 60 * 1000L) }
         Log.d(TAG, "onCreate")
     }
 
@@ -205,7 +244,7 @@ class SpeechCaptureService : Service() {
         audioRecord = ar
         capturing.set(true)
         ar.startRecording()
-        updateNotification("Translating video audio to Hindi…")
+        updateNotification("Translating video audio…")
         OverlayService.updateText("", "Listening…")
         Log.d(TAG, "Capture started — chunk=1s overlap=${OVERLAP_BYTES}B buf=${bufSize}B")
 
@@ -215,11 +254,24 @@ class SpeechCaptureService : Service() {
             val readBuf  = ByteArray(4096)
 
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
+
+                // ── Back-off if Whisper has been failing repeatedly ────────
+                val failures = consecutiveFailures.get()
+                if (failures >= FAILURE_THRESHOLD) {
+                    val backoffMs = minOf(
+                        (failures - FAILURE_THRESHOLD + 1) * BACKOFF_STEP_MS,
+                        MAX_BACKOFF_MS
+                    )
+                    Log.d(TAG, "Back-off ${backoffMs}ms after $failures consecutive failures")
+                    Thread.sleep(backoffMs)
+                }
+
                 val rec  = audioRecord ?: break
                 val read = rec.read(readBuf, 0, readBuf.size)
 
                 if (read == AudioRecord.ERROR_INVALID_OPERATION
-                    || read == AudioRecord.ERROR_BAD_VALUE) {
+                    || read == AudioRecord.ERROR_BAD_VALUE
+                ) {
                     Log.e(TAG, "AudioRecord.read error: $read"); break
                 }
                 if (read <= 0) continue
@@ -254,6 +306,19 @@ class SpeechCaptureService : Service() {
 
     // ── Whisper HTTP ───────────────────────────────────────────────────────────
 
+    /**
+     * Send one 1-second WAV chunk to whisper_server.py.
+     *
+     * RESILIENCE:
+     *  - All exceptions are caught — the capture loop ALWAYS continues.
+     *  - On success, consecutiveFailures resets to 0.
+     *  - On failure, consecutiveFailures increments; capture thread will
+     *    apply back-off on the next iteration.
+     *  - If whisper_server.py returns only a source-language transcript
+     *    (field "source_text"), we translate it via local LibreTranslate.
+     *  - If whisper_server.py returns a ready Hindi "text" field, we use
+     *    it directly without hitting LibreTranslate.
+     */
     private fun sendToWhisper(pcmBytes: ByteArray) {
         try {
             val wavBytes = pcmToWav(pcmBytes)
@@ -266,48 +331,136 @@ class SpeechCaptureService : Service() {
             conn.readTimeout    = 8_000
             conn.outputStream.use { it.write(wavBytes) }
 
-            if (conn.responseCode != 200) return
+            if (conn.responseCode != 200) {
+                Log.w(TAG, "Whisper HTTP ${conn.responseCode} — skipping chunk, will retry")
+                consecutiveFailures.incrementAndGet()
+                return
+            }
 
             val body      = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
             val json      = JSONObject(body)
+
+            // whisper_server.py may translate itself (returns "text" in target lang)
+            // or just return the raw transcript (returns "source_text")
             val hindiText = json.optString("text",        "").trim()
-            val srcText   = json.optString("source_text", "").trim()
+            val srcText   = json.optString("source_text", hindiText).trim()
             val lang      = json.optString("language",    "")
             val conf      = json.optDouble("confidence",   0.0)
 
-            if (hindiText.length < 2) return
+            // Reset back-off on success
+            consecutiveFailures.set(0)
+
+            // Determine what to display
+            val displayText: String = when {
+                hindiText.length >= 2 -> hindiText          // server did translation
+                srcText.length  >= 2  -> translateLocally(srcText, lang)  // we translate
+                else -> return                              // silence / noise
+            }
+
+            if (displayText.length < 2) return
 
             val now = System.currentTimeMillis()
-            if (hindiText == lastPushedHindi && (now - lastPushedTimeMs) < DEDUP_WINDOW_MS) return
+            if (displayText == lastPushedHindi
+                && (now - lastPushedTimeMs) < DEDUP_WINDOW_MS
+            ) return
 
-            lastPushedHindi  = hindiText
+            lastPushedHindi  = displayText
             lastPushedTimeMs = now
             latestOriginal   = srcText
             latestEnglish    = srcText
-            latestHindi      = hindiText
+            latestHindi      = displayText
 
-            Log.d(TAG, "[$lang ${(conf * 100).toInt()}%] ${hindiText.take(60)}")
+            Log.d(TAG, "[$lang ${(conf * 100).toInt()}%] ${displayText.take(60)}")
 
             mainHandler.post {
-                MainActivity.instance?.onTranslation(srcText, hindiText, hindiText)
+                MainActivity.instance?.onTranslation(srcText, displayText, displayText)
             }
 
-            streamWords(srcText, hindiText)
+            streamWords(srcText, displayText)
 
         } catch (e: Exception) {
-            Log.w(TAG, "Whisper: ${e.javaClass.simpleName}: ${e.message}")
+            // IMPORTANT: we only log — the capture loop keeps running
+            consecutiveFailures.incrementAndGet()
+            Log.w(TAG, "Whisper error (failure #${consecutiveFailures.get()}): " +
+                "${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    // ── Local LibreTranslate (offline) ─────────────────────────────────────────
+
+    /**
+     * Translate [text] from [sourceLang] to Hindi using the local
+     * LibreTranslate instance at 127.0.0.1:5000.
+     *
+     * This is called only when whisper_server.py does NOT perform translation
+     * itself (i.e., it returns "source_text" but not "text").
+     *
+     * LibreTranslate must be started with --load-only en,hi,ja,... to work
+     * offline. The command shown in the README does this.
+     *
+     * Returns the input text unchanged on any failure (so the UI always shows
+     * something, even if it's the source language).
+     */
+    private fun translateLocally(text: String, sourceLang: String): String {
+        // Map Whisper language codes to LibreTranslate codes
+        val src = when (sourceLang.lowercase()) {
+            "japanese", "ja"     -> "ja"
+            "chinese",  "zh"     -> "zh"
+            "korean",   "ko"     -> "ko"
+            "french",   "fr"     -> "fr"
+            "german",   "de"     -> "de"
+            "spanish",  "es"     -> "es"
+            "turkish",  "tr"     -> "tr"
+            "arabic",   "ar"     -> "ar"
+            "portuguese","pt"    -> "pt"
+            "russian",  "ru"     -> "ru"
+            "indonesian","id"    -> "id"
+            "english",  "en"     -> "en"
+            else                 -> "en"   // default: assume English source
+        }
+
+        val targetLang = when (SpeechCaptureService.targetLanguage) {
+            "hindi"   -> "hi"
+            "english" -> "en"
+            else      -> "hi"
+        }
+
+        // No-op: already in target language
+        if (src == targetLang) return text
+
+        return try {
+            val body = JSONObject().apply {
+                put("q",      text)
+                put("source", src)
+                put("target", targetLang)
+                put("format", "text")
+            }.toString()
+
+            val conn = URL(LIBRE_URL).openConnection() as HttpURLConnection
+            conn.requestMethod  = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput       = true
+            conn.connectTimeout = 4_000
+            conn.readTimeout    = 8_000
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+
+            if (conn.responseCode != 200) {
+                Log.w(TAG, "LibreTranslate HTTP ${conn.responseCode} — using source text")
+                return text
+            }
+
+            val resp = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            JSONObject(resp).optString("translatedText", text).trim()
+                .ifEmpty { text }
+
+        } catch (e: Exception) {
+            Log.w(TAG, "LibreTranslate error: ${e.message} — using source text")
+            text   // graceful fallback: show source-language text
         }
     }
 
     // ── Word streaming ─────────────────────────────────────────────────────────
 
-    /**
-     * Splits [hindiText] into words and posts each one to [OverlayService.appendWord]
-     * at [WORD_INTERVAL_MS] intervals.
-     *
-     * Cancels any in-flight stream from the previous Whisper result first,
-     * so stale words never appear after a fresh result starts streaming.
-     */
     private fun streamWords(srcText: String, hindiText: String) {
         val words = hindiText.split(Regex("\\s+")).filter { it.isNotEmpty() }
         if (words.isEmpty()) return
@@ -362,14 +515,16 @@ class SpeechCaptureService : Service() {
             NotificationChannel(
                 CHANNEL_ID, "Internal Audio Capture", NotificationManager.IMPORTANCE_LOW
             ).apply { setShowBadge(false) }
-             .also { getSystemService(NotificationManager::class.java)
-                         .createNotificationChannel(it) }
+             .also {
+                 getSystemService(NotificationManager::class.java)
+                     .createNotificationChannel(it)
+             }
         }
     }
 
     private fun buildNotification(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Caption Lens — Translating to Hindi")
+            .setContentTitle("Caption Lens — Translating")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true).setSilent(true).build()
