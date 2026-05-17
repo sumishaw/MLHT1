@@ -23,8 +23,6 @@ class CaptionLensApp extends StatelessWidget {
 }
 
 // ── Model / server state machine ───────────────────────────────────────────────
-// "model" here = whisper_server.py readiness (no download needed, it's pre-installed)
-
 enum ModelState { checking, notDownloaded, downloading, ready, error }
 
 // ── Home page ──────────────────────────────────────────────────────────────────
@@ -44,17 +42,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String displayText      = 'Tap START → approve screen capture → play any video…';
   bool   isRunning        = false;
   bool   hasOverlay       = false;
-  String targetLang       = 'hindi';   // default Hindi — that's the app's purpose
+  String targetLang       = 'hindi';
   String statusMsg        = '';
   int    translationCount = 0;
   bool   _micPulse        = false;
   Timer? _pulseTimer;
 
-  // Whisper server state (reuses ModelState enum so Flutter UI cards still work)
+  // Whisper server state
   ModelState modelState   = ModelState.checking;
   int downloadPercent     = 0;
-  int downloadedMb        = 0;
-  int totalMb             = 0;
   String modelErrorMsg    = '';
 
   // ── init ──────────────────────────────────────────────────────────────────
@@ -79,6 +75,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           if (mounted) setState(() {
             modelState      = ModelState.ready;
             downloadPercent = 100;
+            // Clear any previous error message
+            modelErrorMsg   = '';
+            // FIX: If capture was running and whisper recovered, update status
+            if (isRunning) statusMsg = '';
           });
           break;
         case 'onModelError':
@@ -86,9 +86,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           if (mounted) setState(() {
             modelState    = ModelState.error;
             modelErrorMsg = a['message']?.toString() ?? 'Whisper server not reachable';
+            // FIX: Do NOT stop capture or change isRunning — capture keeps going
+            // The error card is just informational when capture is already running
           });
           break;
-        // onDownloadProgress kept for protocol compatibility — whisper doesn't send it
         case 'onDownloadProgress':
           break;
       }
@@ -125,8 +126,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// Called when user taps "CHECK / RETRY" — triggers a whisper health check
-  Future<void> _startDownload() async {
+  Future<void> _retryWhisperCheck() async {
     try {
       setState(() {
         modelState      = ModelState.downloading;
@@ -144,13 +144,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _applyTranslation(String orig, String en, String hi) {
     if (!mounted) return;
-    // Always show Hindi — that is the only output language for v8
     final show = hi.isNotEmpty ? hi : en;
     if (show.isEmpty) return;
     setState(() {
       originalText     = orig;
       displayText      = show;
       translationCount++;
+      // Clear any whisper error status message once translations flow in
+      if (statusMsg.contains('whisper') || statusMsg.contains('⚠️')) {
+        statusMsg = '';
+      }
     });
   }
 
@@ -165,10 +168,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _start() async {
-    if (modelState != ModelState.ready) {
-      setState(() => statusMsg = '⚠️ Start whisper_server.py first, then tap CHECK');
-      return;
-    }
+    // FIX: We no longer block START on modelState.
+    // Whisper health is shown as a warning card; capture can still start.
+    // The capture service will retry per-chunk and recover automatically
+    // when whisper_server.py comes up.
+
     if (!hasOverlay) {
       await _ch.invokeMethod('requestOverlayPermission');
       if (mounted) setState(() =>
@@ -194,7 +198,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (mounted) setState(() {
       isRunning        = true;
       translationCount = 0;
-      statusMsg        = '';
+      statusMsg        = modelState == ModelState.error
+          ? '⚠️ Whisper unreachable — will retry each chunk automatically'
+          : '';
       displayText      = 'Listening to video audio…';
       originalText     = '';
     });
@@ -359,9 +365,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           borderColor: Colors.orange.withOpacity(0.4),
           bgColor: Colors.orange.withOpacity(0.06),
           title: 'Whisper Server Not Running',
-          subtitle: 'Start whisper_server.py on the tablet first.\npython3 whisper_server.py',
+          subtitle: 'Start whisper_server.py on the tablet first.\npython3 whisper_server.py\n'
+              'You can still tap START — captions will appear once it connects.',
           trailing: ElevatedButton(
-            onPressed: _startDownload,
+            onPressed: _retryWhisperCheck,
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.orangeAccent,
               foregroundColor: Colors.black,
@@ -406,25 +413,31 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           borderColor: Colors.greenAccent.withOpacity(0.3),
           bgColor: Colors.green.withOpacity(0.06),
           title: 'Speech Model Ready',
-          subtitle: 'faster-whisper · Hindi output · No censoring',
+          subtitle: 'faster-whisper · local LibreTranslate · fully offline',
           trailing: const Icon(Icons.check, color: Colors.greenAccent, size: 20),
         );
 
       case ModelState.error:
+        // FIX: Error card is WARNING only — START is still enabled.
+        // We show a softer colour (amber not red) when capture is running
+        // to indicate "degraded but not broken".
+        final captureRunning = isRunning;
         return _cardShell(
-          icon: Icons.error_outline,
-          iconColor: Colors.redAccent,
-          borderColor: Colors.red.withOpacity(0.4),
-          bgColor: Colors.red.withOpacity(0.06),
-          title: 'Whisper Server Unreachable',
+          icon: captureRunning ? Icons.warning_amber_rounded : Icons.error_outline,
+          iconColor: captureRunning ? Colors.amberAccent : Colors.redAccent,
+          borderColor: (captureRunning ? Colors.amber : Colors.red).withOpacity(0.4),
+          bgColor: (captureRunning ? Colors.amber : Colors.red).withOpacity(0.06),
+          title: captureRunning
+              ? 'Whisper Unreachable — Retrying…'
+              : 'Whisper Server Unreachable',
           subtitle: modelErrorMsg.isNotEmpty
               ? modelErrorMsg
               : 'Start whisper_server.py then tap RETRY',
           trailing: ElevatedButton(
-            onPressed: _startDownload,
+            onPressed: _retryWhisperCheck,
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.redAccent,
-              foregroundColor: Colors.white,
+              backgroundColor: captureRunning ? Colors.amberAccent : Colors.redAccent,
+              foregroundColor: captureRunning ? Colors.black : Colors.white,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
@@ -635,7 +648,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // ── Start / Stop button ────────────────────────────────────────────────────
 
   Widget _buildStartStopButton() {
-    final busy = modelState == ModelState.downloading || modelState == ModelState.checking;
+    // FIX: Only block START while actively checking (spinner state).
+    // Error / notDownloaded states no longer disable START — capture can
+    // still work and will recover automatically when whisper comes online.
+    final busy = modelState == ModelState.checking ||
+                 modelState == ModelState.downloading;
+
     return SizedBox(
       width: double.infinity,
       child: ElevatedButton.icon(
