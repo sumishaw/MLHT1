@@ -8,6 +8,8 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.ActivityCompat
@@ -20,32 +22,31 @@ import java.net.URL
 import java.util.concurrent.Executors
 
 /**
- * MainActivity
+ * MainActivity  —  Fixed version
  *
- * Replaces Vosk / ModelDownloadService with a whisper_server.py health check.
- * The Flutter UI calls the same MethodChannel API as before — only the model
- * download methods are remapped to whisper server readiness checks so the
- * existing Flutter UI (which shows "Speech Model Ready") keeps working.
- *
- * Method mapping (old → new):
- *   isModelReady        → GET http://127.0.0.1:8765/ready
- *   getModelStatus      → "ready" / "not_downloaded" based on whisper health
- *   startModelDownload  → triggers a background whisper health check;
- *                          fires onModelReady when server responds
- *   onDownloadProgress  → not sent (whisper is pre-installed, no download needed)
- *   onModelReady        → sent when whisper /ready returns true
- *   onModelError        → sent when whisper server is unreachable
+ * KEY FIXES:
+ *  1. Whisper health-check failure NO LONGER stops or locks out capture.
+ *     The UI shows the error card but capture can still be started/continued.
+ *  2. Periodic background health-check (every 15 s) so the UI stays in sync
+ *     with the server without user interaction.
+ *  3. "startSpeechCapture" no longer requires modelState == ready in Kotlin
+ *     (the Flutter guard was already the only gate; now it also won't block
+ *     on a transient health-check failure if capture was previously working).
+ *  4. Health check is fully offline-safe — only touches 127.0.0.1.
  */
 class MainActivity : FlutterActivity() {
 
     companion object {
         @Volatile var instance: MainActivity? = null
 
-        private const val REQ_MEDIA_PROJECTION = 200
+        private const val REQ_MEDIA_PROJECTION  = 200
         private const val REQ_AUDIO_PERMISSION  = 100
         private const val TAG                   = "MainActivity"
 
-        private const val WHISPER_HEALTH_URL = "http://127.0.0.1:8765/ready"
+        private const val WHISPER_HEALTH_URL    = "http://127.0.0.1:8765/ready"
+
+        // How often (ms) we silently re-check whisper while app is foregrounded
+        private const val HEALTH_POLL_INTERVAL_MS = 15_000L
     }
 
     private val CHANNEL = "overlay_channel"
@@ -53,8 +54,17 @@ class MainActivity : FlutterActivity() {
 
     @Volatile private var pendingProjectionResult: MethodChannel.Result? = null
 
-    // Background executor for whisper health check (non-blocking)
+    // Single-thread executor — health checks never pile up
     private val healthExecutor = Executors.newSingleThreadExecutor()
+
+    // Main-thread handler for periodic polling
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val healthPollRunnable: Runnable = object : Runnable {
+        override fun run() {
+            checkAndNotifyWhisperReady(silent = true)
+            mainHandler.postDelayed(this, HEALTH_POLL_INTERVAL_MS)
+        }
+    }
 
     // ── Flutter method channel ─────────────────────────────────────────────────
 
@@ -71,10 +81,12 @@ class MainActivity : FlutterActivity() {
 
                 "requestOverlayPermission" -> {
                     if (!Settings.canDrawOverlays(this)) {
-                        startActivity(Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:$packageName")
-                        ))
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:$packageName")
+                            )
+                        )
                         result.success(false)
                     } else {
                         result.success(true)
@@ -94,7 +106,7 @@ class MainActivity : FlutterActivity() {
                 "checkAccessibilityEnabled" -> result.success(true)
                 "openAccessibilitySettings" -> result.success(true)
 
-                // ── Whisper server readiness (replaces Vosk model checks) ────
+                // ── Whisper server readiness ─────────────────────────────────
 
                 "isModelReady" -> checkWhisperReady { ready ->
                     runOnUiThread { result.success(ready) }
@@ -107,13 +119,14 @@ class MainActivity : FlutterActivity() {
                 }
 
                 /**
-                 * Flutter calls startModelDownload on first launch (or retry).
-                 * Instead of downloading, we check if whisper_server.py is running
-                 * and fire onModelReady / onModelError so the Flutter UI updates.
+                 * Flutter calls startModelDownload on first launch or RETRY tap.
+                 * We trigger a health check and fire the appropriate callback.
+                 * IMPORTANT: A failure here does NOT prevent capture — it only
+                 * updates the UI status card.
                  */
                 "startModelDownload" -> {
-                    result.success(true)   // acknowledge immediately
-                    checkAndNotifyWhisperReady()
+                    result.success(true)          // acknowledge immediately
+                    checkAndNotifyWhisperReady(silent = false)
                 }
 
                 // ── Overlay ──────────────────────────────────────────────────
@@ -131,6 +144,12 @@ class MainActivity : FlutterActivity() {
 
                 // ── Speech capture ────────────────────────────────────────────
 
+                /**
+                 * FIX: We no longer block startSpeechCapture on whisper health.
+                 * The capture service connects to whisper per-chunk; if whisper
+                 * is temporarily unreachable for one chunk it retries on the next.
+                 * Capture is NEVER stopped due to a health-check failure.
+                 */
                 "startSpeechCapture" ->
                     requestAudioThenProjection(result)
 
@@ -143,38 +162,44 @@ class MainActivity : FlutterActivity() {
                     result.success(SpeechCaptureService.isRunning)
 
                 "setTargetLanguage" -> {
-                    // Always Hindi — kept for Flutter UI compatibility
-                    SpeechCaptureService.targetLanguage = "hindi"
+                    val lang = call.argument<String>("language") ?: "hindi"
+                    SpeechCaptureService.targetLanguage = lang
                     result.success(true)
                 }
 
                 "getLatestTranslation" ->
-                    result.success(mapOf(
-                        "original" to SpeechCaptureService.latestOriginal,
-                        "english"  to SpeechCaptureService.latestEnglish,   // source-lang text
-                        "hindi"    to SpeechCaptureService.latestHindi
-                    ))
+                    result.success(
+                        mapOf(
+                            "original" to SpeechCaptureService.latestOriginal,
+                            "english"  to SpeechCaptureService.latestEnglish,
+                            "hindi"    to SpeechCaptureService.latestHindi
+                        )
+                    )
 
                 else -> result.notImplemented()
             }
         }
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    // ── Lifecycle ──────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Check whisper readiness on launch so the Flutter UI shows the
-        // correct model status without waiting for the user to tap anything.
-        checkAndNotifyWhisperReady()
+        // Initial check on launch
+        checkAndNotifyWhisperReady(silent = false)
+        // Start periodic polling
+        mainHandler.postDelayed(healthPollRunnable, HEALTH_POLL_INTERVAL_MS)
     }
 
     override fun onResume() {
         super.onResume()
         instance = this
+        // Re-check immediately when coming back to the app (e.g. after starting whisper)
+        checkAndNotifyWhisperReady(silent = false)
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(healthPollRunnable)
         pendingProjectionResult?.success(false)
         pendingProjectionResult = null
         healthExecutor.shutdownNow()
@@ -182,10 +207,11 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
-    // ── Whisper server health checks ──────────────────────────────────────────
+    // ── Whisper server health checks ───────────────────────────────────────────
 
     /**
-     * Asynchronously check if whisper_server.py is running.
+     * Asynchronously check if whisper_server.py is running on 127.0.0.1.
+     * Fully offline-safe — no internet access needed.
      * [onResult] is called on the executor thread with true/false.
      */
     private fun checkWhisperReady(onResult: (Boolean) -> Unit) {
@@ -207,31 +233,40 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * Check whisper readiness and broadcast the result to the Flutter UI
-     * via the same callbacks that ModelDownloadService used to send.
-     * This keeps the Flutter UI working without any Dart-side changes.
+     * Check whisper readiness and broadcast the result to Flutter UI.
+     *
+     * [silent] = true  → only fire onModelReady (don't spam onModelError
+     *                     every 15 s if whisper hasn't started yet — the
+     *                     user already saw the error card on launch).
+     * [silent] = false → fire both onModelReady and onModelError (used on
+     *                     launch, onResume, and RETRY taps).
      */
-    private fun checkAndNotifyWhisperReady() {
+    private fun checkAndNotifyWhisperReady(silent: Boolean) {
         checkWhisperReady { ready ->
             runOnUiThread {
                 if (ready) {
                     Log.d(TAG, "whisper_server.py is ready")
                     methodChannel?.invokeMethod("onModelReady", null)
-                } else {
+                } else if (!silent) {
                     Log.w(TAG, "whisper_server.py not reachable on port 8765")
                     methodChannel?.invokeMethod(
                         "onModelError",
-                        mapOf("message" to
-                            "Whisper server not running.\n" +
-                            "Start it with:\n  python3 whisper_server.py\n" +
-                            "Then tap RETRY.")
+                        mapOf(
+                            "message" to
+                                "Whisper server not running.\n" +
+                                "Start it with:\n  python3 whisper_server.py\n" +
+                                "Then tap RETRY."
+                        )
                     )
                 }
+                // If silent && !ready: do nothing — don't change the UI state
+                // so the user isn't confused by a flicker back to "error" state
+                // if whisper briefly hiccups while capture is running fine.
             }
         }
     }
 
-    // ── Permission + projection flow ──────────────────────────────────────────
+    // ── Permission + projection flow ───────────────────────────────────────────
 
     private fun requestAudioThenProjection(result: MethodChannel.Result) {
         if (!Settings.canDrawOverlays(this)) {
@@ -310,7 +345,7 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────────────
 
     private fun startForegroundServiceCompat(intent: Intent) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -331,11 +366,10 @@ class MainActivity : FlutterActivity() {
     /** Called from SpeechCaptureService to push a translation to the Flutter UI. */
     fun onTranslation(original: String, english: String, hindi: String) {
         runOnUiThread {
-            methodChannel?.invokeMethod("onTranslation", mapOf(
-                "original" to original,
-                "english"  to english,
-                "hindi"    to hindi
-            ))
+            methodChannel?.invokeMethod(
+                "onTranslation",
+                mapOf("original" to original, "english" to english, "hindi" to hindi)
+            )
         }
     }
 }
