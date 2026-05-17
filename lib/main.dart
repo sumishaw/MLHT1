@@ -75,19 +75,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           if (mounted) setState(() {
             modelState      = ModelState.ready;
             downloadPercent = 100;
-            // Clear any previous error message
             modelErrorMsg   = '';
-            // FIX: If capture was running and whisper recovered, update status
             if (isRunning) statusMsg = '';
           });
           break;
         case 'onModelError':
+          // FIX: Ignore onModelError entirely if capture is running.
+          // The capture service retries per-chunk. Showing the red card
+          // while captions are actively flowing is confusing and wrong.
+          if (isRunning) break;
           final a = call.arguments as Map? ?? {};
           if (mounted) setState(() {
-            modelState    = ModelState.error;
-            modelErrorMsg = a['message']?.toString() ?? 'Whisper server not reachable';
-            // FIX: Do NOT stop capture or change isRunning — capture keeps going
-            // The error card is just informational when capture is already running
+            // FIX: Only transition to error if we're not already in a
+            // "good" state (ready). A background poll race could deliver
+            // a stale error after a ready notification.
+            if (modelState != ModelState.ready) {
+              modelState    = ModelState.error;
+              modelErrorMsg = a['message']?.toString() ?? 'Whisper server not reachable';
+            }
           });
           break;
         case 'onDownloadProgress':
@@ -96,14 +101,25 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
 
     _checkPermissions();
-    _checkModelStatus();
+    // FIX: Only do one check on init — MainActivity.onCreate() already
+    // fires a non-silent check via the native side. We just sync the UI.
+    _syncModelState();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _checkPermissions();
-      _checkModelStatus();
+      // FIX: Do NOT call _checkModelStatus() or _syncModelState() here
+      // when capture is running. The native side already fires silent
+      // polls every 30 s. Calling it from Flutter too creates a race:
+      //   1. Flutter sets state → checking (spinner, START disabled)
+      //   2. Native check returns ready → state → ready
+      // This causes the START button to flicker disabled on every
+      // screen-unlock when the user is actively watching a video.
+      if (!isRunning) {
+        _syncModelState();
+      }
     }
   }
 
@@ -116,6 +132,34 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  /// Syncs the Flutter UI model state with what the native side knows.
+  /// Does NOT set modelState to "checking" first — avoids the spinner
+  /// flash that briefly disables the START button.
+  Future<void> _syncModelState() async {
+    try {
+      final ready = await _ch.invokeMethod<bool>('isModelReady') ?? false;
+      if (mounted) setState(() {
+        // Only update if the result is different from current state
+        // to avoid unnecessary rebuilds / flickers.
+        if (ready && modelState != ModelState.ready) {
+          modelState    = ModelState.ready;
+          modelErrorMsg = '';
+        } else if (!ready && modelState == ModelState.checking) {
+          // We were checking — now we know it's not ready
+          modelState = ModelState.notDownloaded;
+        }
+        // If modelState is already error/ready/notDownloaded and the
+        // result matches, leave it unchanged.
+      });
+    } catch (_) {
+      if (mounted && modelState == ModelState.checking) {
+        setState(() => modelState = ModelState.notDownloaded);
+      }
+    }
+  }
+
+  /// Full re-check — sets checking spinner, then resolves.
+  /// Only called from RETRY button or first-ever cold start.
   Future<void> _checkModelStatus() async {
     try {
       if (mounted) setState(() => modelState = ModelState.checking);
@@ -150,7 +194,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       originalText     = orig;
       displayText      = show;
       translationCount++;
-      // Clear any whisper error status message once translations flow in
+      // If translations are flowing, whisper is clearly working —
+      // clear the error card immediately.
+      if (modelState == ModelState.error) {
+        modelState    = ModelState.ready;
+        modelErrorMsg = '';
+      }
       if (statusMsg.contains('whisper') || statusMsg.contains('⚠️')) {
         statusMsg = '';
       }
@@ -168,11 +217,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _start() async {
-    // FIX: We no longer block START on modelState.
-    // Whisper health is shown as a warning card; capture can still start.
-    // The capture service will retry per-chunk and recover automatically
-    // when whisper_server.py comes up.
-
     if (!hasOverlay) {
       await _ch.invokeMethod('requestOverlayPermission');
       if (mounted) setState(() =>
@@ -198,11 +242,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (mounted) setState(() {
       isRunning        = true;
       translationCount = 0;
-      statusMsg        = modelState == ModelState.error
-          ? '⚠️ Whisper unreachable — will retry each chunk automatically'
-          : '';
-      displayText      = 'Listening to video audio…';
-      originalText     = '';
+      // FIX: Once capture starts, clear any error state so the card
+      // doesn't show a stale red error while captions are working.
+      if (modelState == ModelState.error) {
+        modelState    = ModelState.notDownloaded; // neutral, not error
+        modelErrorMsg = '';
+      }
+      statusMsg   = '';
+      displayText = 'Listening to video audio…';
+      originalText = '';
     });
   }
 
@@ -343,6 +391,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // ── Model / Whisper server card ────────────────────────────────────────────
 
   Widget _buildModelCard() {
+    // FIX: Never show the error card while capture is running —
+    // show a neutral "Whisper retrying…" amber card instead.
+    if (isRunning && modelState == ModelState.error) {
+      return _cardShell(
+        icon: Icons.sync,
+        iconColor: Colors.amberAccent,
+        borderColor: Colors.amber.withOpacity(0.3),
+        bgColor: Colors.amber.withOpacity(0.05),
+        title: 'Whisper — Reconnecting…',
+        subtitle: 'Audio capture is running. Whisper will reconnect automatically.',
+        trailing: const SizedBox(
+          width: 18, height: 18,
+          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.amberAccent),
+        ),
+      );
+    }
+
     switch (modelState) {
       case ModelState.checking:
         return _cardShell(
@@ -399,7 +464,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     style: TextStyle(color: Colors.white, fontSize: 13,
                         fontWeight: FontWeight.w600)),
                 SizedBox(height: 4),
-                Text('Pinging http://127.0.0.1:8765/ready',
+                Text('Pinging 127.0.0.1:8765',
                     style: TextStyle(color: Colors.white54, fontSize: 11)),
               ]),
             ),
@@ -418,26 +483,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         );
 
       case ModelState.error:
-        // FIX: Error card is WARNING only — START is still enabled.
-        // We show a softer colour (amber not red) when capture is running
-        // to indicate "degraded but not broken".
-        final captureRunning = isRunning;
         return _cardShell(
-          icon: captureRunning ? Icons.warning_amber_rounded : Icons.error_outline,
-          iconColor: captureRunning ? Colors.amberAccent : Colors.redAccent,
-          borderColor: (captureRunning ? Colors.amber : Colors.red).withOpacity(0.4),
-          bgColor: (captureRunning ? Colors.amber : Colors.red).withOpacity(0.06),
-          title: captureRunning
-              ? 'Whisper Unreachable — Retrying…'
-              : 'Whisper Server Unreachable',
+          icon: Icons.error_outline,
+          iconColor: Colors.redAccent,
+          borderColor: Colors.red.withOpacity(0.4),
+          bgColor: Colors.red.withOpacity(0.06),
+          title: 'Whisper Server Unreachable',
           subtitle: modelErrorMsg.isNotEmpty
               ? modelErrorMsg
               : 'Start whisper_server.py then tap RETRY',
           trailing: ElevatedButton(
             onPressed: _retryWhisperCheck,
             style: ElevatedButton.styleFrom(
-              backgroundColor: captureRunning ? Colors.amberAccent : Colors.redAccent,
-              foregroundColor: captureRunning ? Colors.black : Colors.white,
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
@@ -648,11 +707,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   // ── Start / Stop button ────────────────────────────────────────────────────
 
   Widget _buildStartStopButton() {
-    // FIX: Only block START while actively checking (spinner state).
-    // Error / notDownloaded states no longer disable START — capture can
-    // still work and will recover automatically when whisper comes online.
-    final busy = modelState == ModelState.checking ||
-                 modelState == ModelState.downloading;
+    // FIX: Only block START while actively checking (spinner state) AND
+    // only on first cold start — not on onResume when capture is running.
+    // Error / notDownloaded states never disable START.
+    final busy = !isRunning &&
+                 (modelState == ModelState.checking ||
+                  modelState == ModelState.downloading);
 
     return SizedBox(
       width: double.infinity,
