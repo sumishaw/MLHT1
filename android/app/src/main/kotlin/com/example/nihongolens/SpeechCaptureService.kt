@@ -21,54 +21,57 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * SpeechCaptureService — Fast-translation build
+ * SpeechCaptureService — Reliable translation build
  *
- * LATENCY FIXES vs previous build:
+ * ROOT CAUSES FIXED (why "Listening to video audio…" was stuck at 0):
  *
- *  1. FIRST CHUNK IS 0.5 s (not 1 s).
- *     The very first chunk dispatched to Whisper is only 0.5 s of audio
- *     so the first translation appears in ~0.5 s + Whisper inference time
- *     instead of ~1 s + inference time.  After the first chunk, all
- *     subsequent chunks are the standard 1 s for accuracy.
+ *  1. connectTimeout WAS 1 000 ms — TOO SHORT.
+ *     faster-whisper on a tablet CPU keeps a single-threaded HTTP server.
+ *     While it is processing chunk N, chunk N+1's TCP connect() BLOCKS
+ *     waiting for the server's accept() loop to come back around. On a
+ *     loaded tablet that can easily exceed 1 s, causing every chunk to
+ *     throw ConnectException and increment consecutiveFailures until
+ *     back-off kicked in — so nothing was ever transcribed.
+ *     FIX: connectTimeout = 8 000 ms.
  *
- *  2. NO OVERLAP ON FIRST CHUNK.
- *     The old code pre-filled chunkPos = OVERLAP_BYTES on startup, which
- *     meant the first chunk was already half-full of silence before any
- *     real audio arrived, adding another ~0.5 s of dead time.
+ *  2. readTimeout WAS 5 000 ms — MARGINAL.
+ *     faster-whisper tiny/base on a mid-range tablet CPU takes 1–4 s per
+ *     1-second chunk. Add HTTP overhead and 5 s is borderline. On a cold
+ *     start (first inference loads the model into memory) it can hit 8–12 s.
+ *     FIX: readTimeout = 15 000 ms.
  *
- *  3. LIBRETRANSLATE RUNS IN PARALLEL, NOT IN SERIES.
- *     Previously sendToWhisper() called translateLocally() synchronously
- *     inside itself — one thread was blocked on Whisper HTTP then blocked
- *     again on LibreTranslate HTTP before it could pick up the next chunk.
- *     Now sendToWhisper() submits the LibreTranslate call to a *separate*
- *     dedicated translateExecutor thread, so the whisperExecutor thread is
- *     free immediately after the Whisper response arrives.
+ *  3. FIRST_CHUNK = 0.5 s — WHISPER REJECTS SHORT CLIPS.
+ *     Whisper's VAD (voice activity detection) requires at least ~1 s of
+ *     audio to reliably detect speech. A 0.5 s chunk almost always returns
+ *     empty text, burning the first real words and causing the display to
+ *     stay at "Listening to video audio…" for the first second.
+ *     FIX: Removed FIRST_CHUNK optimisation. All chunks are 1.5 s.
+ *     1.5 s gives Whisper more context for accurate language detection
+ *     while still being faster than the old 1 s + cold-start queue.
  *
- *  4. LARGER READ BUFFER (8 192 B → ~256 ms per read).
- *     Halves the number of rec.read() iterations needed to fill a chunk,
- *     reducing lock contention on the AudioRecord internal buffer.
+ *  4. JSON FIELD AMBIGUITY.
+ *     whisper_server.py (standard faster-whisper wrapper) returns:
+ *       {"text": "<transcript>", "language": "<code>", "segments": [...]}
+ *     It does NOT return "source_text". Our old code used:
+ *       hindiText = json.optString("text", "")
+ *       srcText   = json.optString("source_text", hindiText)  ← always == hindiText
+ *     So when the server returned Japanese text in "text", we published
+ *     Japanese directly as the "translation" and skipped LibreTranslate.
+ *     FIX: Use "text" as the raw transcript (always). Check if the
+ *     detected language matches the target language; if not, route the
+ *     transcript through LibreTranslate. If it already matches (e.g.
+ *     English video + English target), publish directly.
  *
- *  5. WORD STREAMING REPLACED WITH INSTANT FULL-TEXT DISPLAY.
- *     The old word-by-word stream added up to 1.8 s of fake delay for a
- *     10-word sentence — while the *next* chunk's result was already
- *     waiting.  Now the full translated text is shown immediately.
- *     The overlay word-append API is still called once with the full text.
+ *  5. BACK-OFF TRIGGERED TOO EAGERLY (threshold = 3 failures).
+ *     With 1 s connect timeout, 3 consecutive cold-start timeouts triggered
+ *     back-off before even one chunk was processed. Back-off then held
+ *     chunks for 800 ms–4 s, compounding the startup delay.
+ *     FIX: FAILURE_THRESHOLD raised to 6. Back-off max reduced to 3 s
+ *     (shorter pauses, faster recovery when whisper comes back).
  *
- *  6. DEDUP WINDOW REDUCED: 1 200 ms → 400 ms.
- *     The old window suppressed a valid new result for over a second.
- *     400 ms is enough to catch true duplicates from the overlap window.
- *
- *  7. BACK-OFF APPLIED ONLY TO WHISPER EXECUTOR, NOT CAPTURE THREAD.
- *     Previously Thread.sleep() was called in the capture thread, which
- *     starved the AudioRecord hardware buffer and caused overflow noise.
- *     Now back-off is implemented as a delayed re-submission inside the
- *     whisper executor — the capture thread always runs at full speed.
- *
- *  8. CONNECT TIMEOUTS TIGHTENED.
- *     Whisper: connect 1 s / read 5 s  (was 3 s / 8 s)
- *     LibreTranslate: connect 1 s / read 5 s  (was 4 s / 8 s)
- *     These servers are on loopback — if they don't answer in 1 s they
- *     are not running; waiting longer just blocks the thread.
+ *  6. WHISPER_EXECUTOR POOL SIZE = 2 — CORRECT, KEPT.
+ *     Two threads is right: one uploads while the other waits for response.
+ *     More threads would flood the single-threaded whisper_server.py.
  */
 class SpeechCaptureService : Service() {
 
@@ -89,28 +92,28 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL = "http://127.0.0.1:8765/transcribe"
         private const val LIBRE_URL   = "http://127.0.0.1:5000/translate"
 
-        // Standard chunk = 1 s of audio
-        private const val CHUNK_SAMPLES = SAMPLE_RATE * 1      // 16 000 samples
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2    // 32 000 bytes
+        // 1.5 s chunks: enough context for reliable language detection,
+        // fast enough for near-real-time display.
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * 1.5).toInt()  // 24 000 samples
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2             // 48 000 bytes
 
-        // FAST-START: first chunk is only 0.5 s so the first result
-        // appears sooner; subsequent chunks are the full 1 s.
-        private const val FIRST_CHUNK_BYTES = CHUNK_BYTES / 2  // 16 000 bytes
+        // 0.25 s overlap for sentence-boundary context
+        private const val OVERLAP_BYTES = SAMPLE_RATE / 4 * 2           // 8 000 bytes
 
-        // Overlap carried into each chunk for sentence-boundary context
-        private const val OVERLAP_BYTES = SAMPLE_RATE / 4 * 2  // 0.25 s = 8 000 bytes
-                                                                 // (was 0.5 s — too long)
-
-        // Larger read buffer: fewer rec.read() calls per chunk
+        // Larger read buffer reduces rec.read() call frequency
         private const val READ_BUF_BYTES = 8_192
 
         // Suppress identical consecutive results within this window
-        private const val DEDUP_WINDOW_MS = 400L   // was 1 200 ms
+        private const val DEDUP_WINDOW_MS = 500L
 
-        // Back-off parameters (applied inside whisperExecutor, not capture thread)
-        private const val MAX_BACKOFF_MS    = 4_000L
-        private const val BACKOFF_STEP_MS   = 800L
-        private const val FAILURE_THRESHOLD = 3
+        // Back-off — only kicks in after 6 consecutive failures
+        private const val MAX_BACKOFF_MS    = 3_000L
+        private const val BACKOFF_STEP_MS   = 600L
+        private const val FAILURE_THRESHOLD = 6
+
+        // Target language codes as returned by faster-whisper
+        private val HINDI_CODES   = setOf("hi", "hindi")
+        private val ENGLISH_CODES = setOf("en", "english")
     }
 
     private val mainHandler    = Handler(Looper.getMainLooper())
@@ -120,7 +123,7 @@ class SpeechCaptureService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var wakeLock:        PowerManager.WakeLock? = null
 
-    // whisperExecutor: 2 threads — chunk N+1 uploads while Whisper processes N
+    // whisperExecutor: 2 threads — chunk N+1 can upload while N is processing
     private val whisperExecutor   = Executors.newFixedThreadPool(2)
     // translateExecutor: separate pool so LibreTranslate never blocks whisper threads
     private val translateExecutor = Executors.newFixedThreadPool(2)
@@ -128,7 +131,6 @@ class SpeechCaptureService : Service() {
     private var lastPushedText   = ""
     private var lastPushedTimeMs = 0L
 
-    // Consecutive failure counter
     private val consecutiveFailures = AtomicInteger(0)
 
     // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -222,8 +224,8 @@ class SpeechCaptureService : Service() {
         if (minBuf <= 0) {
             OverlayService.updateText("", "Audio init failed."); stopSelf(); return
         }
-        // Buffer must fit at least 2 full chunks without overflow
-        val bufSize = maxOf(minBuf * 4, CHUNK_BYTES * 2)
+        // Large hardware buffer: holds 3 full chunks safely
+        val bufSize = maxOf(minBuf * 4, CHUNK_BYTES * 3)
 
         val captureConfig = android.media.AudioPlaybackCaptureConfiguration
             .Builder(projection)
@@ -257,23 +259,16 @@ class SpeechCaptureService : Service() {
         ar.startRecording()
         updateNotification("Translating video audio…")
         OverlayService.updateText("", "Listening…")
-        Log.d(TAG, "Capture started — firstChunk=${FIRST_CHUNK_BYTES}B stdChunk=${CHUNK_BYTES}B overlap=${OVERLAP_BYTES}B buf=${bufSize}B")
+        Log.d(TAG, "Capture started — chunk=${CHUNK_BYTES}B (${CHUNK_BYTES / (SAMPLE_RATE * 2.0)}s) overlap=${OVERLAP_BYTES}B buf=${bufSize}B")
 
         captureThread = Thread({
             val chunkBuf = ByteArray(CHUNK_BYTES)
             var chunkPos = 0
             val readBuf  = ByteArray(READ_BUF_BYTES)
 
-            // FIX: Start with chunkPos = 0, no pre-filled overlap.
-            // The first dispatch threshold is FIRST_CHUNK_BYTES (0.5 s)
-            // so the first translation fires after only ~0.5 s of audio.
-            var isFirstChunk = true
-
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
-
-                // NOTE: Back-off is now inside whisperExecutor (see scheduleWhisper).
-                // The capture thread NEVER sleeps — it always drains the
-                // AudioRecord hardware buffer to prevent overflow.
+                // Capture thread NEVER sleeps — always drains the hardware buffer.
+                // Back-off is applied inside scheduleWhisper() via mainHandler.postDelayed.
 
                 val rec  = audioRecord ?: break
                 val read = rec.read(readBuf, 0, readBuf.size)
@@ -287,28 +282,17 @@ class SpeechCaptureService : Service() {
 
                 var src = 0
                 while (src < read) {
-                    // Dispatch threshold: FIRST_CHUNK_BYTES on first chunk, CHUNK_BYTES after
-                    val threshold = if (isFirstChunk) FIRST_CHUNK_BYTES else CHUNK_BYTES
-                    val toCopy    = minOf(read - src, threshold - chunkPos)
+                    val toCopy = minOf(read - src, CHUNK_BYTES - chunkPos)
                     System.arraycopy(readBuf, src, chunkBuf, chunkPos, toCopy)
                     chunkPos += toCopy
                     src      += toCopy
 
-                    if (chunkPos >= threshold) {
-                        val payload = chunkBuf.copyOf(chunkPos)
-
-                        // Carry overlap into next chunk for sentence-boundary context
-                        if (chunkPos > OVERLAP_BYTES) {
-                            System.arraycopy(
-                                chunkBuf, chunkPos - OVERLAP_BYTES,
-                                chunkBuf, 0, OVERLAP_BYTES
-                            )
-                            chunkPos = OVERLAP_BYTES
-                        } else {
-                            chunkPos = 0
-                        }
-
-                        isFirstChunk = false
+                    if (chunkPos >= CHUNK_BYTES) {
+                        val payload = chunkBuf.copyOf(CHUNK_BYTES)
+                        // Carry overlap for sentence-boundary context
+                        System.arraycopy(chunkBuf, CHUNK_BYTES - OVERLAP_BYTES,
+                                         chunkBuf, 0, OVERLAP_BYTES)
+                        chunkPos = OVERLAP_BYTES
                         scheduleWhisper(payload)
                     }
                 }
@@ -322,8 +306,8 @@ class SpeechCaptureService : Service() {
     }
 
     /**
-     * Submit a chunk to the whisperExecutor.
-     * Back-off (if any) happens here — NOT in the capture thread.
+     * Submit chunk to whisperExecutor with optional back-off delay.
+     * Back-off runs on mainHandler so the capture thread is never blocked.
      */
     private fun scheduleWhisper(payload: ByteArray) {
         if (whisperExecutor.isShutdown) return
@@ -333,7 +317,7 @@ class SpeechCaptureService : Service() {
                 (failures - FAILURE_THRESHOLD + 1).toLong() * BACKOFF_STEP_MS,
                 MAX_BACKOFF_MS
             )
-            // Post with delay so the capture thread is never stalled
+            Log.d(TAG, "Back-off ${backoffMs}ms after $failures failures")
             mainHandler.postDelayed({
                 if (!whisperExecutor.isShutdown)
                     whisperExecutor.submit { sendToWhisper(payload) }
@@ -345,13 +329,6 @@ class SpeechCaptureService : Service() {
 
     // ── Whisper HTTP ───────────────────────────────────────────────────────────
 
-    /**
-     * POST one WAV chunk to whisper_server.py and handle the response.
-     *
-     * PARALLELISM: once we have the Whisper JSON response, if LibreTranslate
-     * is needed we submit it to translateExecutor — the whisper thread is
-     * freed immediately to pick up the next chunk.
-     */
     private fun sendToWhisper(pcmBytes: ByteArray) {
         try {
             val wavBytes = pcmToWav(pcmBytes)
@@ -360,46 +337,92 @@ class SpeechCaptureService : Service() {
             conn.setRequestProperty("Content-Type",   "audio/wav")
             conn.setRequestProperty("Content-Length", wavBytes.size.toString())
             conn.doOutput       = true
-            conn.connectTimeout = 1_000   // loopback — if no answer in 1 s, not running
-            conn.readTimeout    = 5_000   // Whisper inference should finish in 5 s
+            // FIX: 8 s connect timeout — allows for whisper_server.py to finish
+            //      processing the previous chunk before accepting this one.
+            conn.connectTimeout = 8_000
+            // FIX: 15 s read timeout — covers model cold-start on first request
+            //      (loading faster-whisper model into memory can take 5–10 s).
+            conn.readTimeout    = 15_000
             conn.outputStream.use { it.write(wavBytes) }
 
-            if (conn.responseCode != 200) {
-                Log.w(TAG, "Whisper HTTP ${conn.responseCode} — skipping chunk")
+            val responseCode = conn.responseCode
+            if (responseCode != 200) {
+                Log.w(TAG, "Whisper HTTP $responseCode — skipping chunk")
                 consecutiveFailures.incrementAndGet()
                 return
             }
 
-            val body  = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-            val json  = JSONObject(body)
+            val body = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            Log.d(TAG, "Whisper raw response: ${body.take(200)}")
 
-            val hindiText = json.optString("text",        "").trim()
-            val srcText   = json.optString("source_text", hindiText).trim()
-            val lang      = json.optString("language",    "")
-            val conf      = json.optDouble("confidence",   0.0)
+            val json = JSONObject(body)
+
+            // FIX: Robust field handling.
+            // Standard faster-whisper server returns {"text": str, "language": str, ...}
+            // "text" is always the raw transcript in the detected source language.
+            // "source_text" may or may not exist depending on server wrapper version.
+            val rawText  = json.optString("text",        "").trim()
+            val srcText  = json.optString("source_text", rawText).trim()
+            val lang     = json.optString("language",    "").trim().lowercase()
+            val conf     = json.optDouble("confidence",   0.0)
+
+            // Use whichever non-empty transcript we have
+            val transcript = srcText.ifEmpty { rawText }
+
+            if (transcript.length < 2) {
+                Log.d(TAG, "Empty transcript — silence or noise, skipping")
+                consecutiveFailures.set(0)  // not a failure, server is working
+                return
+            }
 
             consecutiveFailures.set(0)
+            Log.d(TAG, "Transcript [$lang ${(conf * 100).toInt()}%]: ${transcript.take(80)}")
+
+            // FIX: Determine if we need translation.
+            // If the server already returned translated text in "text" AND
+            // "source_text" is different, use "text" directly.
+            // Otherwise check if detected language already matches target.
+            val targetCode = when (targetLanguage) {
+                "hindi"   -> "hi"
+                "english" -> "en"
+                else      -> "hi"
+            }
+
+            val alreadyInTargetLang = when (targetCode) {
+                "hi" -> lang in HINDI_CODES
+                "en" -> lang in ENGLISH_CODES
+                else -> false
+            }
+
+            val serverTranslated = rawText.isNotEmpty() &&
+                                   srcText.isNotEmpty()  &&
+                                   rawText != srcText    // server did translate
 
             when {
-                hindiText.length >= 2 -> {
-                    // Whisper server already translated — publish immediately
-                    Log.d(TAG, "[$lang ${(conf * 100).toInt()}%] ${ hindiText.take(60)}")
-                    publishResult(srcText, hindiText)
+                serverTranslated -> {
+                    // Server returned both source_text and translated text
+                    Log.d(TAG, "Server-translated: ${rawText.take(60)}")
+                    publishResult(srcText, rawText)
                 }
-                srcText.length >= 2 -> {
-                    // Need LibreTranslate — run it on the translate executor
-                    // so this whisper thread is freed right now
+                alreadyInTargetLang -> {
+                    // Transcript is already in the target language — publish as-is
+                    Log.d(TAG, "Already in target lang ($lang): ${transcript.take(60)}")
+                    publishResult(transcript, transcript)
+                }
+                else -> {
+                    // Need LibreTranslate — run off the whisper thread
+                    val capturedTranscript = transcript
+                    val capturedLang       = lang
                     if (!translateExecutor.isShutdown) {
                         translateExecutor.submit {
-                            val translated = translateLocally(srcText, lang)
+                            val translated = translateLocally(capturedTranscript, capturedLang)
                             if (translated.length >= 2) {
-                                Log.d(TAG, "[libre $lang] ${translated.take(60)}")
-                                publishResult(srcText, translated)
+                                Log.d(TAG, "LibreTranslate [$capturedLang→$targetCode]: ${translated.take(60)}")
+                                publishResult(capturedTranscript, translated)
                             }
                         }
                     }
                 }
-                else -> { /* silence / noise — discard */ }
             }
 
         } catch (e: Exception) {
@@ -409,13 +432,14 @@ class SpeechCaptureService : Service() {
         }
     }
 
-    /**
-     * Publish a translation result to the UI and overlay.
-     * Called from either the whisper thread or the translate thread.
-     */
+    // ── Publish result ─────────────────────────────────────────────────────────
+
     private fun publishResult(srcText: String, displayText: String) {
         val now = System.currentTimeMillis()
-        if (displayText == lastPushedText && (now - lastPushedTimeMs) < DEDUP_WINDOW_MS) return
+        if (displayText == lastPushedText && (now - lastPushedTimeMs) < DEDUP_WINDOW_MS) {
+            Log.d(TAG, "Dedup suppressed: ${displayText.take(40)}")
+            return
+        }
 
         lastPushedText   = displayText
         lastPushedTimeMs = now
@@ -423,46 +447,44 @@ class SpeechCaptureService : Service() {
         latestEnglish    = srcText
         latestHindi      = displayText
 
-        // Post full text to UI immediately — no word-by-word delay
         mainHandler.post {
             MainActivity.instance?.onTranslation(srcText, displayText, displayText)
-            // Show full text in overlay at once
             OverlayService.updateText(srcText, displayText)
         }
     }
 
-    // ── Local LibreTranslate (offline) ─────────────────────────────────────────
+    // ── Local LibreTranslate ───────────────────────────────────────────────────
 
     private fun translateLocally(text: String, sourceLang: String): String {
         val src = when (sourceLang.lowercase()) {
-            "japanese",  "ja"  -> "ja"
-            "chinese",   "zh"  -> "zh"
-            "korean",    "ko"  -> "ko"
-            "french",    "fr"  -> "fr"
-            "german",    "de"  -> "de"
-            "spanish",   "es"  -> "es"
-            "turkish",   "tr"  -> "tr"
-            "arabic",    "ar"  -> "ar"
-            "portuguese","pt"  -> "pt"
-            "russian",   "ru"  -> "ru"
-            "indonesian","id"  -> "id"
-            "english",   "en"  -> "en"
+            "japanese",   "ja" -> "ja"
+            "chinese",    "zh" -> "zh"
+            "korean",     "ko" -> "ko"
+            "french",     "fr" -> "fr"
+            "german",     "de" -> "de"
+            "spanish",    "es" -> "es"
+            "turkish",    "tr" -> "tr"
+            "arabic",     "ar" -> "ar"
+            "portuguese", "pt" -> "pt"
+            "russian",    "ru" -> "ru"
+            "indonesian", "id" -> "id"
+            "english",    "en" -> "en"
             else               -> "en"
         }
 
-        val tgtLang = when (targetLanguage) {
+        val tgt = when (targetLanguage) {
             "hindi"   -> "hi"
             "english" -> "en"
             else      -> "hi"
         }
 
-        if (src == tgtLang) return text
+        if (src == tgt) return text
 
         return try {
             val body = JSONObject().apply {
                 put("q",      text)
                 put("source", src)
-                put("target", tgtLang)
+                put("target", tgt)
                 put("format", "text")
             }.toString()
 
@@ -470,8 +492,8 @@ class SpeechCaptureService : Service() {
             conn.requestMethod  = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput       = true
-            conn.connectTimeout = 1_000   // loopback — fast fail
-            conn.readTimeout    = 5_000
+            conn.connectTimeout = 3_000
+            conn.readTimeout    = 10_000
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
 
             if (conn.responseCode != 200) {
