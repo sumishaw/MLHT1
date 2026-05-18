@@ -13,25 +13,40 @@ import android.widget.*
 import androidx.core.app.NotificationCompat
 
 /**
- * OverlayService  —  Word-by-word real-time subtitle overlay
+ * OverlayService — Fast instant-display build
  *
- * Display behaviour (exactly as specified):
+ * WHAT CHANGED vs the word-streaming build:
  *
- *   • Words from Whisper arrive one-by-one via appendWord().
- *   • Each word is appended (with a space) to the current line being built.
- *   • When Line 1 is full (exceeds MAX_CHARS_PER_LINE), the word that caused
- *     overflow becomes the first word of Line 2.
- *   • When Line 2 is full, word appending PAUSES and a 4-second read timer
- *     starts.
- *   • After 4 seconds both lines are cleared (wiped to empty strings) and
- *     appending resumes from Line 1 with any words that queued up during the
- *     read pause.
- *   • After silence (no new words for CLEAR_AFTER_MS) the overlay fades out.
+ *  1. INSTANT FULL-TEXT DISPLAY.
+ *     Previously updateText() split the sentence into individual words and
+ *     fed them through appendWordToLines() one at a time. Each word caused
+ *     a TextView update, and when both lines were full a 4-second READ_PAUSE
+ *     froze all output. A 10-word sentence could take 4+ seconds to fully
+ *     appear on the overlay.
  *
- * Layout:
- *   • Two fixed TextViews stacked vertically, always visible (no wrap).
- *   • Full screen width, anchored near the bottom, draggable.
- *   • White bold text with black shadow — readable over any video.
+ *     Now updateText() shows the translated text IMMEDIATELY as two balanced
+ *     lines with zero delay. No word queue, no read pause, no per-word loop.
+ *
+ *  2. SMART TWO-LINE SPLIT.
+ *     The text is split at the nearest space to the midpoint, so both lines
+ *     are roughly equal length — more readable than filling line 1 to max
+ *     chars and dumping the rest on line 2.
+ *     If the text fits on one line (≤ MAX_CHARS_PER_LINE) it stays on line 1
+ *     with line 2 empty.
+ *
+ *  3. SILENCE FADE-OUT KEPT.
+ *     After CLEAR_AFTER_MS (6 s) of no new text the overlay fades out
+ *     gracefully. This is the only timer that remains.
+ *
+ *  4. DEAD CODE REMOVED.
+ *     appendWord(), onWordArrived(), enqueueWords(), appendWordToLines(),
+ *     startReadPause(), drainWordQueue(), wordQueue, activeLine, isPaused
+ *     are all gone. The companion object still has appendWord() as a no-op
+ *     stub so any callers compile without changes.
+ *
+ * Layout (unchanged):
+ *   Two TextViews stacked vertically, full screen width, anchored near the
+ *   bottom, draggable. White bold text with black shadow.
  */
 class OverlayService : Service() {
 
@@ -42,54 +57,42 @@ class OverlayService : Service() {
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
 
-        // Called by SpeechCaptureService to push full sentences (kept for compat)
+        /**
+         * Primary entry point — called by SpeechCaptureService with the
+         * full translated sentence. Shows text on the overlay immediately.
+         */
         fun updateText(original: String, hindi: String) {
             latestOriginal = original
             latestHindi    = hindi
-            // Full-sentence path: split into words and stream them
-            instance?.enqueueWords(original, hindi.split(Regex("\\s+")).filter { it.isNotEmpty() })
+            instance?.showTextNow(hindi)
         }
 
-        // Word-by-word path called directly from SpeechCaptureService word streamer
+        /**
+         * Legacy stub — kept so SpeechCaptureService compiles unchanged
+         * if it still calls appendWord(). Does nothing; updateText() is
+         * the only path used now.
+         */
+        @Suppress("UNUSED_PARAMETER")
         fun appendWord(original: String, word: String, isLastWord: Boolean) {
-            latestOriginal = original
-            instance?.onWordArrived(word, isLastWord)
+            // no-op — word streaming removed; use updateText() instead
         }
 
         @Volatile var instance: OverlayService? = null
     }
 
-    // ── Tuning constants ───────────────────────────────────────────────────────
+    // ── Tuning ──────────────────────────────────────────────────────────────
 
-    // How many characters fit comfortably on one subtitle line at SP=22.
-    // On a 12-inch tablet (≈800dp wide) this is roughly 38-42 chars.
-    // Adjust down if text overflows the screen edge.
-    private val MAX_CHARS_PER_LINE = 36
+    // Characters that fit comfortably on one line at SP=22 on a 12″ tablet.
+    // Increase if text is too short per line; decrease if it overflows edges.
+    private val MAX_CHARS_PER_LINE = 38
 
-    // How long both lines stay visible after being filled before clearing
-    private val READ_PAUSE_MS = 4_000L
+    // Seconds of silence before the overlay fades out
+    private val CLEAR_AFTER_MS = 6_000L
 
-    // How long after the last word before the overlay fades out (silence)
-    private val CLEAR_AFTER_MS = 8_000L
-
-    // ── State ──────────────────────────────────────────────────────────────────
+    // ── State ────────────────────────────────────────────────────────────────
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // The two live subtitle line strings
-    private var line1 = ""
-    private var line2 = ""
-
-    // Which line is currently being written to (1 or 2)
-    private var activeLine = 1
-
-    // True while the 4-second read timer is running — words queue up
-    private var isPaused = false
-
-    // Words that arrived during the read pause, replayed after clear
-    private val wordQueue = ArrayDeque<String>()
-
-    // View references
     private var windowManager: WindowManager?              = null
     private var overlayView:   View?                       = null
     private var tv1:           TextView?                   = null
@@ -98,11 +101,9 @@ class OverlayService : Service() {
     @Volatile private var viewAdded = false
     @Volatile private var running   = false
 
-    // Pending runnables
-    private var readPauseRunnable: Runnable? = null
     private var silenceClearRunnable: Runnable? = null
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────────
+    // ── Lifecycle ────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
@@ -137,137 +138,81 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── Public word entry points ───────────────────────────────────────────────
+    // ── Public display entry point ────────────────────────────────────────────
 
     /**
-     * Called from SpeechCaptureService word-streamer for each individual word.
-     * Must be called on the main thread (SpeechCaptureService posts via mainHandler).
+     * Display [text] on the overlay immediately, split across two lines.
+     * Must be called on the main thread — SpeechCaptureService already
+     * posts via mainHandler before calling updateText().
+     *
+     * If called from a background thread, use:
+     *   mainHandler.post { showTextNow(text) }
      */
-    fun onWordArrived(word: String, isLastWord: Boolean) {
+    fun showTextNow(text: String) {
         if (!running) return
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
 
-        if (isPaused) {
-            // Collect words during read-pause; they'll drain into Line 1 after clear
-            wordQueue.addLast(word)
-            return
-        }
+        val (l1, l2) = splitToTwoLines(trimmed)
 
-        appendWordToLines(word)
+        // Make both lines fully opaque and set text immediately — no animation delay
+        tv1?.apply { alpha = 1f; this.text = l1 }
+        tv2?.apply { alpha = 1f; this.text = l2 }
 
-        // Reschedule silence-clear every time a word arrives
+        // Restart the silence timer
         rescheduleSilenceClear()
     }
 
+    // ── Two-line split ────────────────────────────────────────────────────────
+
     /**
-     * Full-sentence fallback (used when updateText() is called directly).
-     * Enqueues all words; they are processed the same as streamed words.
+     * Split [text] into two balanced lines.
+     *
+     * Strategy:
+     *  1. If the whole text fits on one line → (text, "")
+     *  2. Otherwise find the space closest to the midpoint and split there,
+     *     so both lines are roughly equal length.
+     *  3. If no space found (one very long word) → hard-split at MAX_CHARS_PER_LINE.
      */
-    fun enqueueWords(original: String, words: List<String>) {
-        mainHandler.post {
-            words.forEach { onWordArrived(it, it == words.last()) }
+    private fun splitToTwoLines(text: String): Pair<String, String> {
+        if (text.length <= MAX_CHARS_PER_LINE) return Pair(text, "")
+
+        val mid = text.length / 2
+        // Search outward from midpoint for a space
+        var bestIdx = -1
+        for (delta in 0..mid) {
+            val idxLeft  = mid - delta
+            val idxRight = mid + delta
+            if (idxLeft >= 0 && text[idxLeft] == ' ') { bestIdx = idxLeft; break }
+            if (idxRight < text.length && text[idxRight] == ' ') { bestIdx = idxRight; break }
+        }
+
+        return if (bestIdx > 0) {
+            Pair(text.substring(0, bestIdx).trim(), text.substring(bestIdx + 1).trim())
+        } else {
+            // No space found — hard split
+            Pair(text.substring(0, MAX_CHARS_PER_LINE), text.substring(MAX_CHARS_PER_LINE).trim())
         }
     }
 
-    // ── Core line logic ────────────────────────────────────────────────────────
-
-    private fun appendWordToLines(word: String) {
-        when (activeLine) {
-            1 -> {
-                val candidate = if (line1.isEmpty()) word else "$line1 $word"
-                if (candidate.length <= MAX_CHARS_PER_LINE) {
-                    // Word fits on Line 1
-                    line1 = candidate
-                    refreshDisplay()
-                } else {
-                    // Line 1 is full — move this word to start of Line 2
-                    activeLine = 2
-                    line2 = word
-                    refreshDisplay()
-                }
-            }
-            2 -> {
-                val candidate = if (line2.isEmpty()) word else "$line2 $word"
-                if (candidate.length <= MAX_CHARS_PER_LINE) {
-                    // Word fits on Line 2
-                    line2 = candidate
-                    refreshDisplay()
-                } else {
-                    // Both lines are now full — start 4-second read timer
-                    // This word is the first word of the next "screen"
-                    wordQueue.addFirst(word)   // re-queue it for after the pause
-                    startReadPause()
-                }
-            }
-        }
-    }
-
-    // ── Read pause (4 seconds) ─────────────────────────────────────────────────
-
-    private fun startReadPause() {
-        isPaused = true
-        cancelReadPause()   // safety: shouldn't already be running
-
-        readPauseRunnable = Runnable {
-            // Clear both lines and reset to Line 1
-            line1      = ""
-            line2      = ""
-            activeLine = 1
-            isPaused   = false
-            refreshDisplay()
-
-            // Drain any words that queued up during the pause
-            drainWordQueue()
-        }
-        mainHandler.postDelayed(readPauseRunnable!!, READ_PAUSE_MS)
-    }
-
-    private fun cancelReadPause() {
-        readPauseRunnable?.let { mainHandler.removeCallbacks(it) }
-        readPauseRunnable = null
-    }
-
-    private fun drainWordQueue() {
-        // Process queued words one at a time; appendWordToLines may trigger
-        // another read-pause partway through, which is fine — the remainder
-        // will be left in wordQueue for the next drain cycle.
-        while (!isPaused && wordQueue.isNotEmpty()) {
-            appendWordToLines(wordQueue.removeFirst())
-        }
-    }
-
-    // ── Silence clear ──────────────────────────────────────────────────────────
+    // ── Silence clear ─────────────────────────────────────────────────────────
 
     private fun rescheduleSilenceClear() {
         silenceClearRunnable?.let { mainHandler.removeCallbacks(it) }
-        silenceClearRunnable = Runnable {
-            // No words for CLEAR_AFTER_MS — fade everything out
-            fadeOutAndClear()
-        }
+        silenceClearRunnable = Runnable { fadeOutAndClear() }
         mainHandler.postDelayed(silenceClearRunnable!!, CLEAR_AFTER_MS)
     }
 
     private fun fadeOutAndClear() {
-        cancelReadPause()
         tv1?.animate()?.alpha(0f)?.setDuration(600)?.start()
         tv2?.animate()?.alpha(0f)?.setDuration(600)?.start()
         mainHandler.postDelayed({
-            line1 = ""; line2 = ""
-            activeLine = 1
-            isPaused   = false
-            wordQueue.clear()
             tv1?.apply { text = ""; alpha = 1f }
             tv2?.apply { text = ""; alpha = 1f }
         }, 650)
     }
 
-    // ── Display refresh ────────────────────────────────────────────────────────
-
-    private fun refreshDisplay() {
-        tv1?.text = line1
-        tv2?.text = line2
-    }
-
-    // ── Overlay construction ───────────────────────────────────────────────────
+    // ── Overlay construction ──────────────────────────────────────────────────
 
     private fun buildOverlay() {
         try {
@@ -284,9 +229,8 @@ class OverlayService : Service() {
                 setShadowLayer(12f, 1f, 1f, Color.BLACK)
                 setBackgroundColor(Color.TRANSPARENT)
                 setPadding(dp(12), dp(2), dp(12), dp(2))
-                maxLines = 1
-                gravity  = Gravity.START
-                // Prevent ellipsis — we control line breaks ourselves
+                maxLines  = 1
+                gravity   = Gravity.START
                 ellipsize = null
             }
 
@@ -349,13 +293,13 @@ class OverlayService : Service() {
         }
     }
 
-    // ── Helpers ────────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
     ).toInt()
 
-    // ── Notification ───────────────────────────────────────────────────────────
+    // ── Notification ──────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
