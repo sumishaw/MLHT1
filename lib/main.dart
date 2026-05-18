@@ -335,7 +335,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           color: isRunning
-              ? (_micPulse ? Colors.red : Colors.red.withOpacity(0.5))
+              ? (_micPulse ? Colors.red : Colors.red.withValues(alpha: 0.5))
               : Colors.white12,
         ),
         child: const Icon(Icons.subtitles, color: Colors.white, size: 20),
@@ -370,9 +370,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _buildInfoBanner() => Container(
     padding: const EdgeInsets.all(12),
     decoration: BoxDecoration(
-      color: Colors.blue.withOpacity(0.08),
+      color: Colors.blue.withValues(alpha: 0.08),
       borderRadius: BorderRadius.circular(10),
-      border: Border.all(color: Colors.blue.withOpacity(0.2)),
+      border: Border.all(color: Colors.blue.withValues(alpha: 0.2)),
     ),
     child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Icon(Icons.info_outline, color: Colors.blue, size: 16),
@@ -397,8 +397,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return _cardShell(
         icon: Icons.sync,
         iconColor: Colors.amberAccent,
-        borderColor: Colors.amber.withOpacity(0.3),
-        bgColor: Colors.amber.withOpacity(0.05),
+        borderColor: Colors.amber.withValues(alpha: 0.3),
+        bgColor: Colors.amber.withValues(alpha: 0.05),
         title: 'Whisper — Reconnecting…',
         subtitle: 'Audio capture is running. Whisper will reconnect automatically.',
         trailing: const SizedBox(
@@ -427,8 +427,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         return _cardShell(
           icon: Icons.cloud_off,
           iconColor: Colors.orangeAccent,
-          borderColor: Colors.orange.withOpacity(0.4),
-          bgColor: Colors.orange.withOpacity(0.06),
+          borderColor: Colors.orange.withValues(alpha: 0.4),
+          bgColor: Colors.orange.withValues(alpha: 0.06),
           title: 'Whisper Server Not Running',
           subtitle: 'Start whisper_server.py on the tablet first.\npython3 whisper_server.py\n'
               'You can still tap START — captions will appear once it connects.',
@@ -448,9 +448,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         return Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            color: Colors.blue.withOpacity(0.07),
+            color: Colors.blue.withValues(alpha: 0.07),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.blue.withOpacity(0.35)),
+            border: Border.all(color: Colors.blue.withValues(alpha: 0.35)),
           ),
           child: const Row(children: [
             SizedBox(
@@ -475,8 +475,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         return _cardShell(
           icon: Icons.check_circle,
           iconColor: Colors.greenAccent,
-          borderColor: Colors.greenAccent.withOpacity(0.3),
-          bgColor: Colors.green.withOpacity(0.06),
+          borderColor: Colors.greenAccent.withValues(alpha: 0.3),
+          bgColor: Colors.green.withValues(alpha: 0.06),
           title: 'Speech Model Ready',
           subtitle: 'faster-whisper · local LibreTranslate · fully offline',
           trailing: const Icon(Icons.check, color: Colors.greenAccent, size: 20),
@@ -486,8 +486,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         return _cardShell(
           icon: Icons.error_outline,
           iconColor: Colors.redAccent,
-          borderColor: Colors.red.withOpacity(0.4),
-          bgColor: Colors.red.withOpacity(0.06),
+          borderColor: Colors.red.withValues(alpha: 0.4),
+          bgColor: Colors.red.withValues(alpha: 0.06),
           title: 'Whisper Server Unreachable',
           subtitle: modelErrorMsg.isNotEmpty
               ? modelErrorMsg
@@ -548,7 +548,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       color: const Color(0xFF111111),
       borderRadius: BorderRadius.circular(10),
       border: Border.all(
-          color: hasOverlay ? Colors.greenAccent.withOpacity(0.3) : Colors.white12),
+          color: hasOverlay ? Colors.greenAccent.withValues(alpha: 0.3) : Colors.white12),
     ),
     child: Row(children: [
       Icon(
@@ -591,7 +591,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     decoration: BoxDecoration(
       color: const Color(0xFF0a1628),
       borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: Colors.blue.withOpacity(0.2)),
+      border: Border.all(color: Colors.blue.withValues(alpha: 0.2)),
     ),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Detects & Translates',
@@ -670,9 +670,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           width: double.infinity,
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: Colors.green.withOpacity(0.08),
+            color: Colors.green.withValues(alpha: 0.08),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.greenAccent.withOpacity(0.3)),
+            border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.3)),
           ),
           child: Text(displayText,
               style: const TextStyle(
@@ -690,9 +690,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _buildStatusBanner() => Container(
     padding: const EdgeInsets.all(12),
     decoration: BoxDecoration(
-      color: Colors.orange.withOpacity(0.1),
+      color: Colors.orange.withValues(alpha: 0.1),
       borderRadius: BorderRadius.circular(8),
-      border: Border.all(color: Colors.orange.withOpacity(0.3)),
+      border: Border.all(color: Colors.orange.withValues(alpha: 0.3)),
     ),
     child: Row(children: [
       const Icon(Icons.info_outline, color: Colors.orange, size: 16),
@@ -745,7 +745,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _chip(String label) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
     decoration: BoxDecoration(
-      color: Colors.white.withOpacity(0.06),
+      color: Colors.white.withValues(alpha: 0.06),
       borderRadius: BorderRadius.circular(20),
       border: Border.all(color: Colors.white12),
     ),
